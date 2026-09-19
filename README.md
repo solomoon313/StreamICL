@@ -20,7 +20,7 @@ Requires Python 3.10 or newer. From the repository root in PowerShell:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
-.\.venv\Scripts\hf download BAAI/bge-small-en-v1.5 --local-dir models/bge-small-en-v1.5 --exclude '*.bin' 'onnx/*' 'openvino/*'
+.\.venv\Scripts\python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='BAAI/bge-small-en-v1.5', local_dir='models/bge-small-en-v1.5', ignore_patterns=['*.bin', 'onnx/*', 'openvino/*'])"
 Copy-Item .env.example .env.local
 .\.venv\Scripts\python -c "import secrets; print(secrets.token_hex(32))"
 ```
@@ -46,7 +46,7 @@ python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
 .venv/bin/pip install -r requirements.txt
-.venv/bin/hf download BAAI/bge-small-en-v1.5 --local-dir models/bge-small-en-v1.5 --exclude '*.bin' 'onnx/*' 'openvino/*'
+.venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='BAAI/bge-small-en-v1.5', local_dir='models/bge-small-en-v1.5', ignore_patterns=['*.bin', 'onnx/*', 'openvino/*'])"
 cp .env.example .env.local
 .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
 nano .env.local
