@@ -4,6 +4,8 @@ This repository contains a text-only Add/Search memory service for Agent Memory 
 
 ## Method
 
+![Add and Search flow of the StreamICL-inspired memory service](docs/method-overview.png)
+
 - Add stores source messages as text chunks of at most 4,000 characters. Positive-score Streaming QA feedback is stored as a question-answer example; nonpositive feedback is acknowledged but not indexed.
 - Embeddings come from an OpenAI-compatible API. The default example configuration uses SiliconFlow's `Qwen/Qwen3-Embedding-8B`.
 - SQLite stores text, unit-normalized vectors, and Add request IDs. Search ranks all memories belonging to the exact `user_id` by cosine similarity and returns at most the requested `top_k`. Multiple-choice `options`, when present, are included in the embedding query.
