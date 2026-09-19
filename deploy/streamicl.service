@@ -1,0 +1,19 @@
+[Unit]
+Description=StreamICL memory API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/StreamICL
+EnvironmentFile=/home/ubuntu/StreamICL/.env.local
+Environment=HF_HUB_OFFLINE=1
+Environment=OMP_NUM_THREADS=2
+Environment=TOKENIZERS_PARALLELISM=false
+ExecStart=/home/ubuntu/StreamICL/.venv/bin/uvicorn participant_text_memory.app:create_app --factory --host 127.0.0.1 --port 8094 --workers 1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

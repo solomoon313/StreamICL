@@ -15,9 +15,8 @@ if ($env:PARTICIPANT_MEMORY_API_KEY.Length -lt 32 -or
     $env:PARTICIPANT_MEMORY_API_KEY.StartsWith('replace-')) {
     throw 'Set a random PARTICIPANT_MEMORY_API_KEY of at least 32 characters'
 }
-if ([string]::IsNullOrWhiteSpace($env:OPENAI_EMBEDDING_API_KEY) -or
-    $env:OPENAI_EMBEDDING_API_KEY.StartsWith('replace-')) {
-    throw 'Set OPENAI_EMBEDDING_API_KEY before starting the service'
+if (-not (Test-Path -LiteralPath (Join-Path $root $env:LOCAL_EMBEDDING_MODEL_PATH))) {
+    throw 'Download the embedding model into LOCAL_EMBEDDING_MODEL_PATH before starting the service'
 }
 
 $python = Join-Path $root '.venv\Scripts\python.exe'

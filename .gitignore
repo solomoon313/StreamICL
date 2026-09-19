@@ -222,6 +222,7 @@ __marimo__/
 .env.*
 !.env.example
 participant_text_memory/data/
+models/
 *.db
 *.db-*
 *.sqlite*

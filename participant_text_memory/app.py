@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import heapq
 import json
-import math
 import os
 import secrets
 import sqlite3
@@ -12,13 +11,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol
 
-import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 
-MAX_PIECE_CHARS = 4000
-RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 class Message(BaseModel):
@@ -53,52 +50,52 @@ class Embedder(Protocol):
 
     async def embed(self, texts: list[str]) -> list[list[float]]: ...
 
+    def pieces(self, text: str) -> list[str]: ...
 
-class APIEmbedder:
-    def __init__(self, base_url: str, api_key: str, model_name: str, batch_size: int = 10) -> None:
-        if not base_url or not api_key or not model_name:
-            raise RuntimeError("embedding base URL, API key, and model are required")
-        self.url = base_url.rstrip("/") + "/embeddings"
-        self.api_key = api_key
-        self.model_name = model_name
-        self.batch_size = max(1, batch_size)
+
+class LocalEmbedder:
+    model_name = EMBEDDING_MODEL
+
+    def __init__(self, model_path: Path) -> None:
+        if not model_path.is_dir():
+            raise RuntimeError(f"local embedding model directory not found: {model_path}")
+        from sentence_transformers import SentenceTransformer
+
+        self.model = SentenceTransformer(str(model_path), device="cpu", local_files_only=True)
+        self.max_tokens = self.model.max_seq_length - self.model.tokenizer.num_special_tokens_to_add(pair=False)
+        if self.max_tokens < 1:
+            raise RuntimeError("embedding model has no usable token capacity")
+        self.lock = asyncio.Lock()
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        vectors: list[list[float]] = []
-        timeout = httpx.Timeout(90.0, connect=15.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            for offset in range(0, len(texts), self.batch_size):
-                batch = texts[offset : offset + self.batch_size]
-                for attempt in range(5):
-                    try:
-                        response = await client.post(
-                            self.url,
-                            headers={"Authorization": f"Bearer {self.api_key}"},
-                            json={"model": self.model_name, "input": batch},
-                        )
-                        if response.status_code in RETRYABLE_STATUS and attempt < 4:
-                            await asyncio.sleep(min(2**attempt, 8))
-                            continue
-                        response.raise_for_status()
-                        data = sorted(response.json()["data"], key=lambda row: row["index"])
-                        if len(data) != len(batch):
-                            raise RuntimeError("embedding response count does not match request")
-                        vectors.extend(_unit_vector([float(x) for x in row["embedding"]]) for row in data)
-                        break
-                    except httpx.RequestError:
-                        if attempt == 4:
-                            raise
-                        await asyncio.sleep(min(2**attempt, 8))
-        return vectors
+        async with self.lock:
+            vectors = await asyncio.to_thread(
+                self.model.encode,
+                texts,
+                batch_size=8,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+        return vectors.tolist()
+
+    def pieces(self, text: str) -> list[str]:
+        offsets = self.model.tokenizer(
+            text, add_special_tokens=False, truncation=False, return_offsets_mapping=True
+        )["offset_mapping"]
+        return _token_pieces(text, offsets, self.max_tokens)
 
 
-def _unit_vector(values: list[float]) -> list[float]:
-    norm = math.sqrt(sum(value * value for value in values))
-    return [value / norm for value in values] if norm else values
-
-
-def _pieces(text: str) -> list[str]:
-    return [text[i : i + MAX_PIECE_CHARS] for i in range(0, len(text), MAX_PIECE_CHARS)]
+def _token_pieces(text: str, offsets: list[tuple[int, int]], max_tokens: int) -> list[str]:
+    if not offsets:
+        return [text]
+    pieces = []
+    start = 0
+    for offset in range(max_tokens, len(offsets), max_tokens):
+        end = offsets[offset - 1][1]
+        pieces.append(text[start:end])
+        start = end
+    pieces.append(text[start:])
+    return pieces
 
 
 def _feedback_experience(content: str) -> str | None:
@@ -200,25 +197,42 @@ class MemoryStore:
         return [(row[0], row[1], row[2], json.loads(row[3])) for row in rows]
 
 
-def _memory_items(request: AddRequest) -> list[tuple[int, int, str, str]]:
+def _memory_items(request: AddRequest, embedder: Embedder) -> list[tuple[int, int, str, str]]:
     items: list[tuple[int, int, str, str]] = []
     for ordinal, message in enumerate(request.messages):
         feedback = _feedback_experience(message.content)
         if feedback == "":
             continue
         content = feedback if feedback is not None else f"{message.role}: {message.content}"
-        for piece, chunk in enumerate(_pieces(content)):
+        for piece, chunk in enumerate(embedder.pieces(content)):
             items.append((ordinal, piece, chunk, _source_time(message.timestamp)))
     return items
+
+
+def _rank_memories(
+    candidates: list[tuple[str, str, str, list[float]]], vector: list[float], top_k: int
+) -> list[dict[str, object]]:
+    scored = heapq.nlargest(
+        top_k,
+        candidates,
+        key=lambda row: sum(a * b for a, b in zip(vector, row[3], strict=True)),
+    )
+    return [
+        {
+            "id": memory_id,
+            "content": content,
+            "score": round(sum(a * b for a, b in zip(vector, stored, strict=True)), 8),
+            "created_at": created_at,
+        }
+        for memory_id, content, created_at, stored in scored
+    ]
 
 
 def create_app(
     *, store: MemoryStore | None = None, embedder: Embedder | None = None, api_key: str | None = None
 ) -> FastAPI:
-    resolved_embedder = embedder or APIEmbedder(
-        os.environ.get("OPENAI_EMBEDDING_API_BASE", "").strip(),
-        os.environ.get("OPENAI_EMBEDDING_API_KEY", "").strip(),
-        os.environ.get("OPENAI_EMBEDDING_MODEL", "").strip(),
+    resolved_embedder = embedder or LocalEmbedder(
+        Path(os.environ.get("LOCAL_EMBEDDING_MODEL_PATH", "models/bge-small-en-v1.5"))
     )
     resolved_store = store or MemoryStore(
         Path(os.environ.get("PARTICIPANT_MEMORY_DATABASE", Path(__file__).parent / "data" / "memory.db")),
@@ -251,18 +265,18 @@ def create_app(
         fingerprint = hashlib.sha256(
             json.dumps(request.model_dump(), ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
-        existing = resolved_store.request_fingerprint(request.request_id)
+        existing = await asyncio.to_thread(resolved_store.request_fingerprint, request.request_id)
         if existing and existing != fingerprint:
             raise HTTPException(status_code=409, detail="request_id reused with a different payload")
         if not existing:
             try:
-                items = _memory_items(request)
+                items = await asyncio.to_thread(_memory_items, request, resolved_embedder)
                 vectors = await resolved_embedder.embed([item[2] for item in items]) if items else []
-                resolved_store.put(request, fingerprint, items, vectors)
+                await asyncio.to_thread(resolved_store.put, request, fingerprint, items, vectors)
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-            except (httpx.HTTPError, RuntimeError) as exc:
-                raise HTTPException(status_code=503, detail="embedding service unavailable") from exc
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail="embedding failed") from exc
         return {
             "success": True, "request_id": request.request_id,
             "user_id": request.user_id, "session_id": request.session_id,
@@ -270,7 +284,7 @@ def create_app(
 
     @app.post("/v1/memories/search", dependencies=[Depends(authorize)])
     async def search(request: SearchRequest) -> dict[str, list[dict[str, object]]]:
-        candidates = resolved_store.by_user(request.user_id)
+        candidates = await asyncio.to_thread(resolved_store.by_user, request.user_id)
         if not candidates:
             return {"data": []}
         query = request.query
@@ -278,23 +292,8 @@ def create_app(
             query += "\nOptions:\n" + "\n".join(request.options)
         try:
             vector = (await resolved_embedder.embed([query]))[0]
-        except (httpx.HTTPError, RuntimeError) as exc:
-            raise HTTPException(status_code=503, detail="embedding service unavailable") from exc
-        scored = heapq.nlargest(
-            request.top_k,
-            candidates,
-            key=lambda row: sum(a * b for a, b in zip(vector, row[3], strict=True)),
-        )
-        return {
-            "data": [
-                {
-                    "id": memory_id,
-                    "content": content,
-                    "score": round(sum(a * b for a, b in zip(vector, stored, strict=True)), 8),
-                    "created_at": created_at,
-                }
-                for memory_id, content, created_at, stored in scored
-            ]
-        }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail="embedding failed") from exc
+        return {"data": await asyncio.to_thread(_rank_memories, candidates, vector, request.top_k)}
 
     return app
