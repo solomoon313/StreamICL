@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Participant text memory
+.env.local
+.env.*
+!.env.example
+participant_text_memory/data/
+*.db
+*.db-*
+*.sqlite*
+.runtime/
+.tools/
+*.log
+.pytest_tmp/
