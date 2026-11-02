@@ -1,17 +1,31 @@
 # StreamICL-inspired Text Memory API
 
-This repository contains a text-only Add/Search memory service for Agent Memory Leaderboard. It is inspired by StreamICL, but it is not a reproduction of the original algorithm. The evaluation platform owns answer generation and scoring; this service only stores and retrieves memory.
+This repository provides a text-only Add/Search memory service for Agent Memory Leaderboard. It is inspired by StreamICL, but it is not a reproduction of Self-StreamICL. The evaluation platform owns answer generation and scoring; this service only stores and retrieves memory.
 
 ## Method
 
-![Add and Search flow of the StreamICL-inspired memory service](docs/method-overview-local.png)
+![Add and Search flow of the StreamICL-inspired memory service](docs/method-overview.png)
 
-- Add splits source messages at the local model's token limit. Positive-score Streaming QA feedback is stored as a question-answer example; nonpositive feedback is acknowledged but not indexed.
-- `BAAI/bge-small-en-v1.5` runs locally on CPU. Neither Add text nor Search queries go to an embedding API.
-- SQLite stores text, unit-normalized vectors, and Add request IDs. Search ranks all memories belonging to the exact `user_id` by cosine similarity and returns at most the requested `top_k`. Multiple-choice `options`, when present, are included in the embedding query.
+- Add divides text into deterministic chunks of at most 8,000 characters. Positive-score Streaming QA feedback is stored as a question-answer example; nonpositive feedback is acknowledged but not indexed.
+- Every chunk is embedded through an OpenAI-compatible embeddings endpoint with the fixed model `text-embedding-v4`. Returned vectors are L2-normalized before storage and ranking.
+- SQLite stores text, normalized vectors, and Add request IDs. Memories are isolated by exact `user_id`.
+- Search embeds the question and any top-level multiple-choice `options`, ranks the user's memories by cosine similarity, and returns at most the requested `top_k`.
 - Add is synchronous: HTTP 200 is returned only after embeddings and SQLite writes complete. Repeating an identical `request_id` is idempotent; reusing one for a different payload returns HTTP 409.
 
-Compared with the original StreamICL baseline, this implementation uses SQLite and an in-process scan instead of FAISS, message chunks and positive-feedback examples instead of question-keyed full trajectories, and caller-provided `top_k` instead of a fixed top four. It does not assemble prompts or call an answer LLM.
+The StreamBench Self-StreamICL reference is a complete answering agent: it indexes only correct self-generated answers by question, retrieves them with BGE and FAISS, and inserts the retrieved examples into the next answer prompt. This service instead exposes the leaderboard Add/Search boundary, persists source-message chunks and positive-feedback examples, and leaves prompt construction and answer generation to the evaluation platform. It does not call an LLM, so no LLM model is configured here; its embedding component uses `text-embedding-v4`.
+
+## Configuration
+
+Copy `.env.example` to `.env.local` and set these values:
+
+```dotenv
+PARTICIPANT_MEMORY_API_KEY=replace-with-a-random-secret-of-at-least-32-characters
+OPENAI_EMBEDDING_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
+OPENAI_EMBEDDING_API_KEY=replace-with-your-embedding-api-key
+PARTICIPANT_MEMORY_DATABASE=participant_text_memory/data/text_embedding_v4_memory.db
+```
+
+`OPENAI_EMBEDDING_API_BASE` must be the OpenAI-compatible API root that contains `/embeddings`; do not append `/embeddings` itself. Keep both API keys private. Use a new SQLite database whenever the embedding model changes because vectors from different models cannot be mixed.
 
 ## Run locally
 
@@ -20,18 +34,17 @@ Requires Python 3.10 or newer. From the repository root in PowerShell:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
-.\.venv\Scripts\python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='BAAI/bge-small-en-v1.5', local_dir='models/bge-small-en-v1.5', ignore_patterns=['*.bin', 'onnx/*', 'openvino/*'])"
 Copy-Item .env.example .env.local
 .\.venv\Scripts\python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-Put the generated secret in `.env.local` as `PARTICIPANT_MEMORY_API_KEY`, then run:
+Put the generated secret and the embedding API credentials in `.env.local`, then run:
 
 ```powershell
 .\start.ps1
 ```
 
-The service listens on `http://127.0.0.1:8094`. The startup script does not create a public tunnel. Keep the API key private. Use a new SQLite database when switching embedding models; vectors from the previous Qwen model cannot be mixed with local BGE vectors.
+The service listens on `http://127.0.0.1:8094`. The startup script does not create a public tunnel.
 
 ## Deploy on Ubuntu 22.04
 
@@ -44,16 +57,14 @@ git clone https://github.com/solomoon313/StreamICL.git
 cd StreamICL
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
-.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='BAAI/bge-small-en-v1.5', local_dir='models/bge-small-en-v1.5', ignore_patterns=['*.bin', 'onnx/*', 'openvino/*'])"
 cp .env.example .env.local
 .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
 nano .env.local
 chmod 600 .env.local
 ```
 
-Replace `PARTICIPANT_MEMORY_API_KEY` with the generated secret. Keep the model and database paths from the example. Never paste the secret into a screenshot, issue, or Git commit. The service loads the model only from disk after it is downloaded. See [Hugging Face's download documentation](https://huggingface.co/docs/huggingface_hub/guides/download).
+Set `PARTICIPANT_MEMORY_API_KEY`, `OPENAI_EMBEDDING_API_BASE`, and `OPENAI_EMBEDDING_API_KEY` in `.env.local`. Keep `PARTICIPANT_MEMORY_DATABASE` on the new `text_embedding_v4_memory.db` path.
 
 Install and start the persistent service:
 
@@ -96,7 +107,7 @@ Add requires `request_id`, `messages` (`role`, nonempty string `content`, option
 .\.venv\Scripts\python -m pytest tests -q
 ```
 
-The SQLite database defaults to `participant_text_memory/data/bge_memory.db` with the example configuration and is ignored by Git. Do not log or publish evaluation payloads or keys. Delete evaluation data within 30 days after a run unless the platform grants written permission to retain it longer. This implementation has not been load-tested for a full public evaluation.
+The SQLite database is ignored by Git. Add text and Search queries are sent to the configured embedding provider, so that provider and its logging policy must satisfy the evaluation's privacy requirements. Do not log or publish evaluation payloads or keys. Delete evaluation data within 30 days after a run unless the platform grants written permission to retain it longer.
 
 ## Attribution
 

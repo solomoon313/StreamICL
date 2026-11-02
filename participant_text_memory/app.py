@@ -4,18 +4,22 @@ import asyncio
 import hashlib
 import heapq
 import json
+import math
 import os
 import secrets
 import sqlite3
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
-EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+EMBEDDING_MODEL = "text-embedding-v4"
+EMBEDDING_MAX_CHARS = 8000
 
 
 class Message(BaseModel):
@@ -53,49 +57,60 @@ class Embedder(Protocol):
     def pieces(self, text: str) -> list[str]: ...
 
 
-class LocalEmbedder:
+class EmbeddingItem(BaseModel):
+    index: int
+    embedding: list[float]
+
+
+class EmbeddingResponse(BaseModel):
+    data: list[EmbeddingItem]
+
+
+class OpenAICompatibleEmbedder:
     model_name = EMBEDDING_MODEL
 
-    def __init__(self, model_path: Path) -> None:
-        if not model_path.is_dir():
-            raise RuntimeError(f"local embedding model directory not found: {model_path}")
-        from sentence_transformers import SentenceTransformer
-
-        self.model = SentenceTransformer(str(model_path), device="cpu", local_files_only=True)
-        self.max_tokens = self.model.max_seq_length - self.model.tokenizer.num_special_tokens_to_add(pair=False)
-        if self.max_tokens < 1:
-            raise RuntimeError("embedding model has no usable token capacity")
-        self.lock = asyncio.Lock()
+    def __init__(
+        self, base_url: str, api_key: str, *, client: httpx.AsyncClient | None = None
+    ) -> None:
+        if not base_url or not api_key:
+            raise RuntimeError("OPENAI_EMBEDDING_API_BASE and OPENAI_EMBEDDING_API_KEY are required")
+        self.endpoint = base_url.rstrip("/") + "/embeddings"
+        self.api_key = api_key
+        self.client = client or httpx.AsyncClient(timeout=60)
+        self.owns_client = client is None
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        async with self.lock:
-            vectors = await asyncio.to_thread(
-                self.model.encode,
-                texts,
-                batch_size=8,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )
-        return vectors.tolist()
+        vectors = []
+        for start in range(0, len(texts), 10):
+            batch = texts[start : start + 10]
+            try:
+                response = await self.client.post(
+                    self.endpoint,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json={"model": self.model_name, "input": batch},
+                )
+                response.raise_for_status()
+                items = sorted(
+                    EmbeddingResponse.model_validate_json(response.content).data,
+                    key=lambda item: item.index,
+                )
+            except (httpx.HTTPError, ValidationError) as exc:
+                raise RuntimeError("embedding request failed") from exc
+            if [item.index for item in items] != list(range(len(batch))):
+                raise RuntimeError("embedding response does not match input")
+            for item in items:
+                norm = math.sqrt(sum(value * value for value in item.embedding))
+                if norm == 0:
+                    raise RuntimeError("embedding response contains a zero vector")
+                vectors.append([value / norm for value in item.embedding])
+        return vectors
 
     def pieces(self, text: str) -> list[str]:
-        offsets = self.model.tokenizer(
-            text, add_special_tokens=False, truncation=False, return_offsets_mapping=True
-        )["offset_mapping"]
-        return _token_pieces(text, offsets, self.max_tokens)
+        return [text[i : i + EMBEDDING_MAX_CHARS] for i in range(0, len(text), EMBEDDING_MAX_CHARS)]
 
-
-def _token_pieces(text: str, offsets: list[tuple[int, int]], max_tokens: int) -> list[str]:
-    if not offsets:
-        return [text]
-    pieces = []
-    start = 0
-    for offset in range(max_tokens, len(offsets), max_tokens):
-        end = offsets[offset - 1][1]
-        pieces.append(text[start:end])
-        start = end
-    pieces.append(text[start:])
-    return pieces
+    async def close(self) -> None:
+        if self.owns_client:
+            await self.client.aclose()
 
 
 def _feedback_experience(content: str) -> str | None:
@@ -231,9 +246,14 @@ def _rank_memories(
 def create_app(
     *, store: MemoryStore | None = None, embedder: Embedder | None = None, api_key: str | None = None
 ) -> FastAPI:
-    resolved_embedder = embedder or LocalEmbedder(
-        Path(os.environ.get("LOCAL_EMBEDDING_MODEL_PATH", "models/bge-small-en-v1.5"))
-    )
+    owned_embedder = None
+    if embedder is None:
+        owned_embedder = OpenAICompatibleEmbedder(
+            os.environ.get("OPENAI_EMBEDDING_API_BASE", "").strip(),
+            os.environ.get("OPENAI_EMBEDDING_API_KEY", "").strip(),
+        )
+    resolved_embedder = embedder or owned_embedder
+    assert resolved_embedder is not None
     resolved_store = store or MemoryStore(
         Path(os.environ.get("PARTICIPANT_MEMORY_DATABASE", Path(__file__).parent / "data" / "memory.db")),
         resolved_embedder.model_name,
@@ -242,7 +262,16 @@ def create_app(
     if not resolved_key:
         raise RuntimeError("PARTICIPANT_MEMORY_API_KEY is required")
 
-    app = FastAPI(title="Participant Text Memory", docs_url=None, redoc_url=None, openapi_url=None)
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        yield
+        if owned_embedder is not None:
+            await owned_embedder.close()
+
+    app = FastAPI(
+        title="Participant Text Memory", docs_url=None, redoc_url=None,
+        openapi_url=None, lifespan=lifespan,
+    )
 
     def authorize(
         authorization: str | None = Header(default=None),

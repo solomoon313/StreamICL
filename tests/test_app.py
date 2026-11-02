@@ -1,12 +1,11 @@
 import asyncio
 import json
-import sys
 from pathlib import Path
-from types import SimpleNamespace
 
+import httpx
 from fastapi.testclient import TestClient
 
-from participant_text_memory.app import AddRequest, LocalEmbedder, MemoryStore, _memory_items, _token_pieces, create_app
+from participant_text_memory.app import AddRequest, MemoryStore, OpenAICompatibleEmbedder, _memory_items, create_app
 
 
 class FakeEmbedder:
@@ -131,45 +130,35 @@ def test_positive_feedback_only_and_long_text_chunks(tmp_path: Path) -> None:
     assert all(len(piece[2]) <= 4000 for piece in pieces)
 
 
-def test_token_chunks_preserve_text() -> None:
-    text = "  alpha  beta\ngamma   delta  "
-    offsets = [(2, 7), (9, 13), (14, 19), (22, 27)]
-    chunks = _token_pieces(text, offsets, 2)
-    assert chunks == ["  alpha  beta", "\ngamma   delta  "]
-    assert "".join(chunks) == text
-    assert _token_pieces("   ", [], 2) == ["   "]
+def test_openai_compatible_embedder() -> None:
+    batch_sizes = []
 
+    async def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://embedding.example/v1/embeddings"
+        assert request.headers["Authorization"] == "Bearer embedding-key"
+        payload = json.loads(request.content)
+        assert payload["model"] == "text-embedding-v4"
+        batch_sizes.append(len(payload["input"]))
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"index": index, "embedding": [3.0, 4.0]}
+                    for index in reversed(range(len(payload["input"])))
+                ]
+            },
+        )
 
-def test_local_embedder_uses_downloaded_model(tmp_path: Path, monkeypatch) -> None:
-    class Tokenizer:
-        def num_special_tokens_to_add(self, *, pair: bool) -> int:
-            assert not pair
-            return 2
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+        embedder = OpenAICompatibleEmbedder(
+            "https://embedding.example/v1", "embedding-key", client=client
+        )
+        vectors = await embedder.embed([f"text-{index}" for index in range(11)])
+        assert vectors == [[0.6, 0.8]] * 11
+        assert batch_sizes == [10, 1]
+        text = "a" * 8001
+        assert embedder.pieces(text) == ["a" * 8000, "a"]
+        await client.aclose()
 
-        def __call__(self, text: str, **kwargs):
-            assert kwargs == {
-                "add_special_tokens": False, "truncation": False, "return_offsets_mapping": True
-            }
-            return {"offset_mapping": [(i, i + 1) for i in range(len(text))]}
-
-    class Vectors:
-        def tolist(self):
-            return [[1.0, 0.0]]
-
-    class Model:
-        max_seq_length = 4
-        tokenizer = Tokenizer()
-
-        def __init__(self, path: str, **kwargs):
-            assert path == str(tmp_path)
-            assert kwargs == {"device": "cpu", "local_files_only": True}
-
-        def encode(self, texts: list[str], **kwargs):
-            assert texts == ["ab"]
-            assert kwargs["normalize_embeddings"] is True
-            return Vectors()
-
-    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Model))
-    embedder = LocalEmbedder(tmp_path)
-    assert embedder.pieces("abcde") == ["ab", "cd", "e"]
-    assert asyncio.run(embedder.embed(["ab"])) == [[1.0, 0.0]]
+    asyncio.run(run())
